@@ -757,7 +757,7 @@ Variant call(zend_function *func, Array &args, zend_array *named_args) {
 
 namespace {
 
-thread_local zend_class_entry *lexical_call_scope = nullptr;
+THREAD_LOCAL zend_class_entry *lexical_call_scope = nullptr;
 
 class LexicalCallScopeGuard final {
   public:

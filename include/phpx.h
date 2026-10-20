@@ -16,6 +16,12 @@
 
 #pragma once
 
+#if defined(__APPLE__) && defined(__clang__)
+// libc++abi matches pointer exceptions by RTTI identity across dylibs. Hidden
+// extension symbols must not give Zend's exception carrier a private typeinfo.
+struct __attribute__((type_visibility("default"))) _zend_object;
+#endif
+
 /**
  * Do not trust any header files of PHP, its internal implementation is very chaotic,
  * which must be wrapped in extern "C" {}
@@ -1124,26 +1130,17 @@ class Variant {
     Variant(const char *str, size_t len) {
         setStr(zend_string_init_fast(str, len));
     }
-    /**
-     * !!! [UNSAFE] `persistent` argument
-     * When `persistent` is `true`, it will never be released until the process exits.
-     * Please note that this approach is intended solely for global constant objects.
-     */
+    // Persistent literals have process lifetime, including construction before
+    // Zend startup. They are immutable and do not participate in refcounting.
     Variant(const char *str, size_t len, bool persistent) {
         if (persistent) {
-            ZVAL_NEW_STR(&val, zend_string_init(str, len, persistent));
-            /**
-             * There is a flaw in PHP's design: persistent strings cause assertion failures upon destruction.
-             * By incrementing the reference count once, these strings are never released,
-             * and are instead reclaimed automatically by the operating system when the process terminates.
-             */
-            addRef();
-            /**
-             * Persistent string must have its hash value precomputed. This string may be used for hash lookups in a
-             * multi-threaded environment. If the hash value is null and requires calculation, it may lead to
-             * multi-thread contention.
-             */
-            zend_string_hash_val(Z_STR(val));
+            auto *literal = zend_string_init(str, len, true);
+            zend_string_hash_val(literal);
+            // Do not use Zend's intern pool: static C++ constructors precede
+            // its initialization. These private immortal strings deliberately
+            // live until process exit, as the persistent constructor promises.
+            GC_ADD_FLAGS(literal, IS_STR_INTERNED | IS_STR_PERMANENT);
+            ZVAL_INTERNED_STR(&val, literal);
         } else {
             setStr(zend_string_init_fast(str, len));
         }

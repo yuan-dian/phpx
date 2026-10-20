@@ -10,22 +10,6 @@ BEGIN_EXTERN_C()
 #endif
 END_EXTERN_C()
 
-static void module_init(zend_module_entry *module) {
-    // php_embed_init() has already started the request. Registering another
-    // persistent module at this point appends persistent function/class keys
-    // after Zend's request cleanup boundary. A temporary module is the Zend
-    // supported form for a module loaded during a request, and its destructor
-    // removes those symbols before shutdown_executor() walks the tables.
-    if (zend_register_module_ex(module, MODULE_TEMPORARY) == nullptr) {
-        zend_error(E_ERROR, "Failed to register module [%s]", module->name);
-        exit(255);
-    }
-    if (zend_startup_module_ex(module) == FAILURE) {
-        zend_error(E_ERROR, "Failed to startup module [%s]", module->name);
-        exit(255);
-    }
-}
-
 static php_stream *s_in_process = nullptr;
 
 static void cli_register_file_handles() {
@@ -65,40 +49,71 @@ static void cli_register_file_handles() {
     zend_register_constant(&ec);
 }
 
-static void module_shutdown(zend_module_entry *module) {
-    // Remove the late temporary module before shutdown_executor() traverses
-    // the function and class tables. Its destructor runs MSHUTDOWN and removes
-    // the module's internal symbols.
-    auto name_len = strlen(module->name);
-    auto lcname = zend_string_alloc(name_len, false);
-    zend_str_tolower_copy(ZSTR_VAL(lcname), module->name, name_len);
-    zend_hash_del(&module_registry, lcname);
-    zend_string_release(lcname);
+// Register the generated module during MINIT, before Zend snapshots persistent
+// symbols and collects request handlers. Late MODULE_TEMPORARY registration
+// leaves Swoole-created requests without the compiled functions and RINIT.
+static zend_module_entry *typephp_runtime_module = nullptr;
+static decltype(zend_module_entry::request_startup_func) project_request_startup = nullptr;
+static decltype(zend_module_entry::request_shutdown_func) project_request_shutdown = nullptr;
+static decltype(php_embed_module.startup) embed_startup = nullptr;
+static bool typephp_runtime_started = false;
+static bool defer_main_request = true;
+
+static zend_result runtime_request_startup(INIT_FUNC_ARGS) {
+#ifdef ZTS
+    const bool main_thread = tsrm_is_main_thread();
+#else
+    const bool main_thread = true;
+#endif
+    // Keep application startup after php_embed_init(), when the host has
+    // installed its standard streams and embedded-file hooks. Workers use
+    // Zend's ordinary RINIT path, including their own request-local caches.
+    if (main_thread && defer_main_request) {
+        return SUCCESS;
+    }
+    typephp_opcode_table_request_startup();
+    return project_request_startup ? project_request_startup(INIT_FUNC_ARGS_PASSTHRU) : SUCCESS;
 }
 
-static zend_module_entry *typephp_runtime_module = nullptr;
-static typephp_module_pre_shutdown typephp_runtime_pre_shutdown = nullptr;
-static uint32_t typephp_runtime_persistent_functions = 0;
-static uint32_t typephp_runtime_persistent_classes = 0;
-static uint32_t typephp_runtime_persistent_constants = 0;
-static bool typephp_runtime_started = false;
+static zend_result runtime_request_shutdown(SHUTDOWN_FUNC_ARGS) {
+    const auto result = project_request_shutdown ? project_request_shutdown(SHUTDOWN_FUNC_ARGS_PASSTHRU) : SUCCESS;
+    typephp_opcode_table_request_shutdown();
+    return result;
+}
 
-extern "C" int typephp_runtime_start(
-    typephp_module_getter get_module, typephp_module_pre_shutdown pre_shutdown, int argc, char **argv) {
+static int runtime_module_startup(sapi_module_struct *sapi) {
+    return php_module_startup(sapi, typephp_runtime_module);
+}
+
+extern "C" int typephp_runtime_start(typephp_module_getter get_module,
+                                     typephp_module_pre_shutdown pre_shutdown,
+                                     int argc,
+                                     char **argv) {
     if (typephp_runtime_started) {
         return 0;
     }
-
-    php_embed_init(argc, argv);
-
-    typephp_opcode_table_install();
-
-    typephp_runtime_persistent_functions = EG(persistent_functions_count);
-    typephp_runtime_persistent_classes = EG(persistent_classes_count);
-    typephp_runtime_persistent_constants = EG(persistent_constants_count);
+    // Kept in the host ABI for older generated entry files. Permanent modules
+    // release their class-owned data through the normal MSHUTDOWN callback.
+    (void) pre_shutdown;
     typephp_runtime_module = get_module();
-    typephp_runtime_pre_shutdown = pre_shutdown;
-    module_init(typephp_runtime_module);
+    project_request_startup = typephp_runtime_module->request_startup_func;
+    project_request_shutdown = typephp_runtime_module->request_shutdown_func;
+    typephp_runtime_module->request_startup_func = runtime_request_startup;
+    typephp_runtime_module->request_shutdown_func = runtime_request_shutdown;
+    embed_startup = php_embed_module.startup;
+    php_embed_module.startup = runtime_module_startup;
+    defer_main_request = true;
+    if (php_embed_init(argc, argv) != SUCCESS) {
+        php_embed_module.startup = embed_startup;
+        typephp_runtime_module->request_startup_func = project_request_startup;
+        typephp_runtime_module->request_shutdown_func = project_request_shutdown;
+        typephp_runtime_module = nullptr;
+        return 255;
+    }
+    // Even a failed application entry must shut down the active PHP request.
+    typephp_runtime_started = true;
+    defer_main_request = false;
+    typephp_opcode_table_install();
 
 #if !defined(PHP_WIN32) && !defined(__wasi__) && !defined(PHPX_IOS) && !defined(PHPX_ANDROID)
     save_ps_args(argc, argv);
@@ -107,11 +122,11 @@ extern "C" int typephp_runtime_start(
     int rc = 0;
     zend_first_try {
         try {
-            char path_translated[] = "embed";
+            static char path_translated[] = "embed";
             cli_register_file_handles();
             SG(request_info).path_translated = path_translated;
-            if (typephp_runtime_module->request_startup_func(typephp_runtime_module->type,
-                                                             typephp_runtime_module->module_number) != SUCCESS) {
+            if (runtime_request_startup(typephp_runtime_module->type, typephp_runtime_module->module_number) !=
+                SUCCESS) {
                 rc = 255;
                 zend_error(E_ERROR, "Failed to initialize request for module [%s]", typephp_runtime_module->name);
             }
@@ -124,75 +139,22 @@ extern "C" int typephp_runtime_start(
         }
     }
     zend_end_try();
-
-    if (rc == 0) {
-        // A fatal error bails out (longjmp) and bypasses the C++ catch above,
-        // so the exit status recorded by the error handler is the fallback.
-        rc = EG(exit_status);
-    }
-
-    // The PHP engine and module are active even if RINIT or the entry point
-    // failed. Let the caller shut down that partial request as usual.
-    typephp_runtime_started = true;
-    return rc;
+    return rc != 0 ? rc : EG(exit_status);
 }
 
 extern "C" void typephp_runtime_stop(void) {
     if (!typephp_runtime_started) {
         return;
     }
-
-    // The TypePHP module is registered after php_embed_init(), so it is not in
-    // PHP's precomputed RSHUTDOWN handler list. Run the user-visible shutdown
-    // phases first, while the TypePHP request state is still alive.
-    EG(flags) |= EG_FLAGS_IN_SHUTDOWN;
-    EG(current_execute_data) = nullptr;
-    if (PG(modules_activated)) {
-        php_call_shutdown_functions();
-        php_free_shutdown_functions();
-    }
-    zend_try {
-        zend_call_destructors();
-    }
-    zend_end_try();
-
-    // The TypePHP module was registered after request startup and therefore is
-    // absent from PHP's precomputed shutdown lists. Run and unload it manually.
-    typephp_runtime_module->request_shutdown_func(typephp_runtime_module->type, typephp_runtime_module->module_number);
-    // Temporary-module class metadata must remain valid until every request
-    // object has been destroyed. Cycles are normally collected later by
-    // shutdown_executor(), but this late module has to be removed before that
-    // point. Collect them after RSHUTDOWN has dropped module-owned roots and
-    // while class entries, property_info and enum constant ASTs are still
-    // alive. This is an embed process-shutdown cost, not an extension
-    // RINIT/RSHUTDOWN cost.
-    zend_try {
-        gc_collect_cycles();
-    }
-    zend_end_try();
-    // Zend's generic temporary-module destructor removes classes before
-    // MSHUTDOWN. Give generated code a narrow hook to release class-owned data
-    // that requires the reverse ordering, without moving the rest of
-    // MSHUTDOWN ahead of normal module cleanup.
-    if (typephp_runtime_pre_shutdown != nullptr) {
-        typephp_runtime_pre_shutdown();
-    }
-    module_shutdown(typephp_runtime_module);
-
-    // Embedded opcode blobs allocate their user functions/classes in the
-    // request arena. Match Zend's release-build fast-shutdown behavior: remove
-    // those table tails without running per-symbol destructors, then let the
-    // request memory manager reclaim the arena as a whole. Debug PHP builds
-    // otherwise report these intentionally bulk-freed allocations as leaks.
-    zend_hash_discard(EG(function_table), typephp_runtime_persistent_functions);
-    zend_hash_discard(EG(class_table), typephp_runtime_persistent_classes);
-    zend_hash_discard(EG(zend_constants), typephp_runtime_persistent_constants);
-    PG(report_memleaks) = false;
-
-    typephp_opcode_table_uninstall();
+    // Zend now owns RSHUTDOWN/MSHUTDOWN, symbol removal and object teardown.
+    // In particular, never unload a process module from a worker request.
     php_embed_shutdown();
-
+    typephp_opcode_table_uninstall();
+    php_embed_module.startup = embed_startup;
+    typephp_runtime_module->request_startup_func = project_request_startup;
+    typephp_runtime_module->request_shutdown_func = project_request_shutdown;
     typephp_runtime_module = nullptr;
-    typephp_runtime_pre_shutdown = nullptr;
+    project_request_startup = nullptr;
+    project_request_shutdown = nullptr;
     typephp_runtime_started = false;
 }

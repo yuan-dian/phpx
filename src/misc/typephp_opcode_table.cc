@@ -1,3 +1,4 @@
+#include <phpx.h>
 #include <typephp_opcode_table.h>
 #include "../../thirdparty/opcache/opcode_unserialize.h"
 
@@ -45,7 +46,7 @@ zend_string *(*old_resolve_path)(zend_string *) = nullptr;
 zend_result (*old_stream_open)(zend_file_handle *) = nullptr;
 php_stream_wrapper_ops wrapped_file_ops;
 php_stream_wrapper wrapped_file_wrapper;
-bool file_wrapper_installed = false;
+static THREAD_LOCAL bool file_wrapper_installed = false;
 bool runtime_hooks_installed = false;
 bool opcode_table_started = false;
 
@@ -217,16 +218,16 @@ extern "C" void typephp_opcode_table_request_startup(void) {
         zend_compile_file = embedded_compile_file;
         zend_resolve_path = resolve_path;
         zend_stream_open_function = stream_open;
+        wrapped_file_ops = *php_plain_files_wrapper.wops;
+        wrapped_file_ops.stream_opener = open_embedded_file;
+        wrapped_file_ops.url_stat = stat_embedded_file;
+        wrapped_file_wrapper = php_plain_files_wrapper;
+        wrapped_file_wrapper.wops = &wrapped_file_ops;
         runtime_hooks_installed = true;
     }
 
     if (file_wrapper_installed) return;
 
-    wrapped_file_ops = *php_plain_files_wrapper.wops;
-    wrapped_file_ops.stream_opener = open_embedded_file;
-    wrapped_file_ops.url_stat = stat_embedded_file;
-    wrapped_file_wrapper = php_plain_files_wrapper;
-    wrapped_file_wrapper.wops = &wrapped_file_ops;
     zend_string *protocol = zend_string_init("file", sizeof("file") - 1, 0);
     if (php_unregister_url_stream_wrapper_volatile(protocol) == SUCCESS &&
         php_register_url_stream_wrapper_volatile(protocol, &wrapped_file_wrapper) == SUCCESS) {

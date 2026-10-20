@@ -5,6 +5,27 @@
 
 using namespace php;
 
+TEST(string, persistent_literal_is_immutable_without_refcount_updates) {
+    String literal(ZEND_STRL("thread-shared-literal"), true);
+    auto *storage = literal.str();
+    ASSERT_TRUE(ZSTR_IS_INTERNED(storage));
+    ASSERT_TRUE(GC_FLAGS(storage) & IS_STR_PERSISTENT);
+    ASSERT_TRUE(GC_FLAGS(storage) & IS_STR_PERMANENT);
+    ASSERT_FALSE(Z_REFCOUNTED_P(literal.const_ptr()));
+    ASSERT_NE(ZSTR_H(storage), 0u);
+    const auto references = GC_REFCOUNT(storage);
+    {
+        String copy(literal);
+        ASSERT_EQ(copy.str(), storage);
+        Array values{{storage, copy}};
+        ASSERT_TRUE(values.item(literal).equals(literal));
+        copy.append("-changed");
+        ASSERT_NE(copy.str(), storage);
+        ASSERT_STREQ(literal.data(), "thread-shared-literal");
+    }
+    ASSERT_EQ(GC_REFCOUNT(storage), references);
+}
+
 TEST(string, builtin_empty_string_reuses_zend_storage) {
     static_assert(std::is_const_v<std::remove_reference_t<decltype(empty_string)>>);
     ASSERT_TRUE(empty_string.isString());
