@@ -3071,10 +3071,39 @@ static inline Object newObject(const Variant &name, FixedArgs args, zend_array *
 }
 
 static inline Object getEnumCase(zend_class_entry *ce, const String &name) {
-    return {zend_enum_get_case(ce, name.str())};
+    if (UNEXPECTED(ce == nullptr)) {
+        throwError("Cannot fetch enum case from null class entry");
+        return {};
+    }
+    if (UNEXPECTED(!(ce->ce_flags & ZEND_ACC_ENUM))) {
+        throwError("Class %s is not an enum", ZSTR_VAL(ce->name));
+        return {};
+    }
+    auto *constant = static_cast<zend_class_constant *>(zend_hash_find_ptr(CE_CONSTANTS_TABLE(ce), name.str()));
+    if (UNEXPECTED(constant == nullptr)) {
+        throwError("Undefined constant %s::%s", ZSTR_VAL(ce->name), name.data());
+        return {};
+    }
+    if (UNEXPECTED(!(ZEND_CLASS_CONST_FLAGS(constant) & ZEND_CLASS_CONST_IS_CASE))) {
+        throwError("Constant %s::%s is not an enum case", ZSTR_VAL(ce->name), name.data());
+        return {};
+    }
+    // Unlike zend_enum_get_case(), this path propagates lazy evaluation
+    // failures rather than asserting that case initialization cannot fail.
+    auto *value = zend_get_class_constant_ex(ce->name, name.str(), ce, ZEND_FETCH_CLASS_EXCEPTION);
+    throwErrorIfOccurred();
+    if (UNEXPECTED(value == nullptr || Z_TYPE_P(value) != IS_OBJECT || Z_OBJCE_P(value) != ce)) {
+        throwError("Invalid enum case %s::%s", ZSTR_VAL(ce->name), name.data());
+        return {};
+    }
+    return {Z_OBJ_P(value)};
 }
 
 static inline String getEnumCaseName(Object &obj) {
+    if (UNEXPECTED(!obj.isObject() || !(obj.ce()->ce_flags & ZEND_ACC_ENUM))) {
+        throwError("Expected an enum case object");
+        return {};
+    }
     return {zend_enum_fetch_case_name(obj.object()), Ctor::Indirect};
 }
 }  // namespace php
